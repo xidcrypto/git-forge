@@ -27,9 +27,9 @@ function nextRequestId(): string {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  const bytes = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': bytes.length, ...headers });
+  res.end(bytes);
 }
 
 function sendWire(res: ServerResponse, answer: WireAnswer): void {
@@ -59,6 +59,8 @@ function authorized(req: IncomingMessage): boolean {
 }
 
 function decodeSegment(segment: string): string {
+  // A segment with no '%' holds no escape: decoding it is the identity. Most segments are plain.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {

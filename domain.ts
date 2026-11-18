@@ -4,6 +4,7 @@
 
 import {
   buildCommitData,
+  commitInfo,
   commitTree,
   flattenTree,
   getCommit,
@@ -404,13 +405,12 @@ export function historyFrom(repo: RepoRec, startOid: string): Array<{ sha: strin
   const out: Array<{ sha: string; message: string; parents: string[]; time: number }> = [];
   const seen = new Set<string>();
   const queue: string[] = [startOid];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const commit = getCommit(repo, oid);
-    if (commit === null) continue;
-    const info = parseCommit(commit.data);
+    const info = commitInfo(repo, oid);
+    if (info === null) continue;
     out.push({ sha: oid, message: info.message, parents: info.parents, time: info.authorTime });
     for (const parent of info.parents) queue.push(parent);
   }

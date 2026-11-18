@@ -4,7 +4,7 @@
 // REST surface creates are built with the same writers, so all four surfaces share one store.
 
 import { createHash } from 'node:crypto';
-import { createInflate, deflateSync } from 'node:zlib';
+import { createInflate, deflateSync, inflateSync } from 'node:zlib';
 import type { GitObject, GitObjectType, RepoRec } from './store.ts';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -90,6 +90,30 @@ export function parseCommit(data: Buffer): CommitInfo {
     }
   }
   return { tree, parents, message, authorTime };
+}
+
+/**
+ * Parsed commits, cached per repository: a commit object is immutable and content-addressed, so
+ * its parse never changes. The history walks below (ancestry, fetch selection, closures) re-read
+ * the same commits constantly; without the cache each visit re-stringifies and re-splits the
+ * object. Callers treat the answer as read-only.
+ */
+const commitInfoCache = new WeakMap<RepoRec, Map<string, CommitInfo>>();
+
+/** The parsed form of a commit object, or null when the oid names no commit in the repository. */
+export function commitInfo(repo: RepoRec, oid: string): CommitInfo | null {
+  let cache = commitInfoCache.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    commitInfoCache.set(repo, cache);
+  }
+  const hit = cache.get(oid);
+  if (hit !== undefined) return hit;
+  const object = repo.objects.get(oid);
+  if (object === undefined || object.type !== 'commit') return null;
+  const info = parseCommit(object.data);
+  cache.set(oid, info);
+  return info;
 }
 
 /** Build a commit object's bytes with one identity for author and committer. */
@@ -221,22 +245,21 @@ export function storeTreeFromFlat(repo: RepoRec, files: ReadonlyMap<string, stri
 
 /** The tree oid of a commit, or null when the commit is unknown. */
 export function commitTree(repo: RepoRec, commitOid: string): string | null {
-  const commit = getCommit(repo, commitOid);
-  if (commit === null) return null;
-  return parseCommit(commit.data).tree;
+  const info = commitInfo(repo, commitOid);
+  return info === null ? null : info.tree;
 }
 
 /** Every ancestor of a commit (itself included), breadth-first; unknown oids are skipped. */
 export function ancestorSet(repo: RepoRec, tip: string): Set<string> {
   const seen = new Set<string>();
   const queue: string[] = [tip];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
-    const commit = getCommit(repo, oid);
-    if (commit === null) continue;
+    const info = commitInfo(repo, oid);
+    if (info === null) continue;
     seen.add(oid);
-    for (const parent of parseCommit(commit.data).parents) queue.push(parent);
+    for (const parent of info.parents) queue.push(parent);
   }
   return seen;
 }
@@ -246,14 +269,14 @@ export function isAncestor(repo: RepoRec, ancestor: string, descendant: string):
   if (ancestor === descendant) return true;
   const seen = new Set<string>();
   const queue: string[] = [descendant];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (oid === ancestor) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const commit = getCommit(repo, oid);
-    if (commit === null) continue;
-    for (const parent of parseCommit(commit.data).parents) queue.push(parent);
+    const info = commitInfo(repo, oid);
+    if (info === null) continue;
+    for (const parent of info.parents) queue.push(parent);
   }
   return false;
 }
@@ -263,14 +286,14 @@ export function mergeBase(repo: RepoRec, a: string, b: string): string | null {
   const ancestorsOfA = ancestorSet(repo, a);
   const seen = new Set<string>();
   const queue: string[] = [b];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestorsOfA.has(oid)) return oid;
-    const commit = getCommit(repo, oid);
-    if (commit === null) continue;
-    for (const parent of parseCommit(commit.data).parents) queue.push(parent);
+    const info = commitInfo(repo, oid);
+    if (info === null) continue;
+    for (const parent of info.parents) queue.push(parent);
   }
   return null;
 }
@@ -298,7 +321,8 @@ export function objectClosure(repo: RepoRec, commits: ReadonlySet<string>): Map<
     const commit = getCommit(repo, oid);
     if (commit === null || out.has(oid)) continue;
     out.set(oid, commit);
-    addTreeClosure(repo, parseCommit(commit.data).tree, out);
+    const info = commitInfo(repo, oid);
+    if (info !== null) addTreeClosure(repo, info.tree, out);
   }
   return out;
 }
@@ -354,7 +378,7 @@ export function writePack(objects: readonly PackInput[]): Buffer {
  * search over candidate ends (inflateSync cannot report where a stream stopped). A truncated or
  * corrupt stream errors the promise, which readPack turns into a throw.
  */
-function inflateAt(buf: Buffer, offset: number, expectedSize: number): Promise<{ data: Buffer; next: number }> {
+function inflateStreamAt(buf: Buffer, offset: number, expectedSize: number): Promise<{ data: Buffer; next: number }> {
   return new Promise((resolve, reject) => {
     const stream = createInflate();
     const chunks: Buffer[] = [];
@@ -370,6 +394,78 @@ function inflateAt(buf: Buffer, offset: number, expectedSize: number): Promise<{
     stream.on('error', reject);
     stream.end(buf.subarray(offset));
   });
+}
+
+/** Past this many unparsed pack bytes, an object's stream is hunted asynchronously instead. */
+const SYNC_INFLATE_MAX_REMAINING = 64 * 1024;
+/** Past this inflated size, an object's stream is hunted asynchronously instead. */
+const SYNC_INFLATE_MAX_SIZE = 16 * 1024;
+
+/** The adler32 of a payload — the last four bytes of every zlib stream, big-endian. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  let pos = 0;
+  while (pos < data.length) {
+    const end = Math.min(pos + 5552, data.length);
+    for (; pos < end; pos += 1) {
+      a += data[pos] as number;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * inflateAt without the stream machinery, for the small objects that dominate the push hot path.
+ * One inflateSync over the rest of the buffer yields the data (zlib stops at the stream's own
+ * final block and ignores what follows, and throws on a truncated or corrupt stream exactly as
+ * the streaming reader errors). The stream's end is then located without a search over candidate
+ * ends — a throwing probe costs far more than a successful inflate — from the stream's own last
+ * four bytes: the adler32 of the data just inflated. The first occurrence of that checksum at or
+ * after the stream's start whose prefix still inflates to exactly `expectedSize` bytes is the
+ * end; a coincidental earlier occurrence names a truncated prefix, which fails the probe and the
+ * scan moves on. The pack's last object needs no end at all (nothing is parsed after it), so its
+ * caller skips the hunt. A wrong inflated size throws the streaming reader's message.
+ */
+function inflateAtSync(buf: Buffer, offset: number, expectedSize: number, isLast: boolean): { data: Buffer; next: number } {
+  const data = inflateSync(buf.subarray(offset));
+  if (data.length !== expectedSize) throw new Error('pack object inflated to the wrong size');
+  if (isLast) return { data, next: buf.length };
+  const sum = adler32(data);
+  const needle = Buffer.from([(sum >>> 24) & 0xff, (sum >>> 16) & 0xff, (sum >>> 8) & 0xff, sum & 0xff]);
+  let from = offset + 2;
+  for (;;) {
+    const at = buf.indexOf(needle, from);
+    if (at === -1) throw new Error('pack object stream end not found');
+    const end = at + 4;
+    let ok = false;
+    try {
+      ok = inflateSync(buf.subarray(offset, end)).length === expectedSize;
+    } catch {
+      ok = false;
+    }
+    if (ok) return { data, next: end };
+    from = at + 1;
+  }
+}
+
+/**
+ * Inflate one pack object at `offset`: synchronously when the object and what remains of the
+ * pack are both small (the common case — a push carries a handful of small objects), through a
+ * stream when either is large, so a huge object's cost stays a single pass either way.
+ */
+function inflateAt(
+  buf: Buffer,
+  offset: number,
+  expectedSize: number,
+  isLast = false,
+): { data: Buffer; next: number } | Promise<{ data: Buffer; next: number }> {
+  return buf.length - offset <= SYNC_INFLATE_MAX_REMAINING && expectedSize <= SYNC_INFLATE_MAX_SIZE
+    ? inflateAtSync(buf, offset, expectedSize, isLast)
+    : inflateStreamAt(buf, offset, expectedSize);
 }
 
 /** Apply a git delta (copy/insert instructions) to a base payload. */
@@ -467,19 +563,19 @@ export async function readPack(repo: RepoRec, buf: Buffer, offset: number): Prom
       }
       const baseIndex = startToIndex.get(start - baseOffset);
       if (baseIndex === undefined) throw new Error('ofs-delta base outside the pack');
-      const { data, next } = await inflateAt(buf, pos, size);
+      const { data, next } = await inflateAt(buf, pos, size, index === count - 1);
       pos = next;
       pending.push({ baseOid: null, baseIndex, index, delta: data });
     } else if (typeCode === 7) {
       const baseOid = buf.toString('hex', pos, pos + 20);
       pos += 20;
-      const { data, next } = await inflateAt(buf, pos, size);
+      const { data, next } = await inflateAt(buf, pos, size, index === count - 1);
       pos = next;
       pending.push({ baseOid, baseIndex: null, index, delta: data });
     } else {
       const type = CODE_TYPES[typeCode];
       if (type === undefined) throw new Error(`unknown pack object type ${typeCode}`);
-      const { data, next } = await inflateAt(buf, pos, size);
+      const { data, next } = await inflateAt(buf, pos, size, index === count - 1);
       pos = next;
       const oid = hashObject(type, data);
       const record = { oid, type, data };
@@ -617,11 +713,11 @@ export function selectFetchObjects(
     while (stack.length > 0) {
       const oid = stack.pop() as string;
       if (hadCommits.has(oid)) continue;
-      const commit = getCommit(repo, oid);
-      if (commit === null) continue;
+      const info = commitInfo(repo, oid);
+      if (info === null) continue;
       hadCommits.add(oid);
       if (clientShallow.has(oid)) continue;
-      for (const parent of parseCommit(commit.data).parents) stack.push(parent);
+      for (const parent of info.parents) stack.push(parent);
     }
   }
   // Tag objects named directly as wants ride along, peeled to their commits for the walk.
@@ -647,11 +743,11 @@ export function selectFetchObjects(
       const next: string[] = [];
       for (const oid of frontier) {
         if (included.has(oid)) continue;
-        const commit = getCommit(repo, oid);
-        if (commit === null) continue;
+        const info = commitInfo(repo, oid);
+        if (info === null) continue;
         included.set(oid, distance);
         if (depth === null && clientShallow.has(oid)) continue;
-        for (const parent of parseCommit(commit.data).parents) next.push(parent);
+        for (const parent of info.parents) next.push(parent);
       }
       if (depth !== null && distance + 1 >= depth) break;
       frontier = next;
@@ -669,9 +765,9 @@ export function selectFetchObjects(
   const unshallow: string[] = [];
   if (depth !== null) {
     for (const oid of included.keys()) {
-      const commit = getCommit(repo, oid);
-      if (commit === null) continue;
-      const cut = parseCommit(commit.data).parents.some((parent) => !included.has(parent) && getCommit(repo, parent) !== null);
+      const info = commitInfo(repo, oid);
+      if (info === null) continue;
+      const cut = info.parents.some((parent) => !included.has(parent) && getCommit(repo, parent) !== null);
       if (cut) shallow.push(oid);
     }
     for (const oid of clientShallow) {
@@ -683,6 +779,55 @@ export function selectFetchObjects(
     shallow,
     unshallow,
   };
+}
+
+/**
+ * Fetch answers, cached per repository: a selection and its pack, keyed by the exact negotiation
+ * (wants, haves, the client's shallow set, the depth). Objects are immutable and content-addressed
+ * and are never removed from a live repository, so once every want, have and shallow oid names an
+ * object the repository already holds, the selection those oids determine can never change — new
+ * objects elsewhere in the repository do not reach into an existing tip's closure. A negotiation
+ * naming an oid the repository does not hold yet is never cached (a later push could give that
+ * oid a meaning it does not have now). Fifty concurrent clones of one tip are the hot case: they
+ * all negotiate identically and now share one selection and one pack.
+ */
+interface FetchPack {
+  selection: FetchSelection;
+  pack: Buffer;
+}
+
+const fetchPackCache = new WeakMap<RepoRec, Map<string, FetchPack>>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchPack(
+  repo: RepoRec,
+  wants: readonly string[],
+  haves: readonly string[],
+  clientShallow: ReadonlySet<string>,
+  depth: number | null,
+): FetchPack {
+  const cacheable =
+    wants.every((oid) => repo.objects.has(oid)) &&
+    haves.every((oid) => repo.objects.has(oid)) &&
+    [...clientShallow].every((oid) => repo.objects.has(oid));
+  if (!cacheable) {
+    const selection = selectFetchObjects(repo, wants, haves, clientShallow, depth);
+    return { selection, pack: writePack(selection.objects) };
+  }
+  let cache = fetchPackCache.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    fetchPackCache.set(repo, cache);
+  }
+  const key = `${depth ?? ''}\n${wants.join(' ')}\n${haves.join(' ')}\n${[...clientShallow].sort().join(' ')}`;
+  let entry = cache.get(key);
+  if (entry === undefined) {
+    const selection = selectFetchObjects(repo, wants, haves, clientShallow, depth);
+    entry = { selection, pack: writePack(selection.objects) };
+    if (cache.size >= FETCH_CACHE_MAX) cache.clear();
+    cache.set(key, entry);
+  }
+  return entry;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -732,18 +877,20 @@ function v0RefLines(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pac
   return lines;
 }
 
+/** The v2 capability advertisement: the same bytes for every repository, built once. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 /** GET info/refs: a v2 capability list for upload-pack when asked, else the v0 advertisement. */
 export function infoRefs(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pack', protocolV2: boolean): WireAnswer {
   if (service === 'git-upload-pack' && protocolV2) {
-    const body = Buffer.concat([
-      pktLine('version 2\n'),
-      pktLine(`agent=${AGENT}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow\n'),
-      pktLine('object-format=sha1\n'),
-      PKT_FLUSH,
-    ]);
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
+    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
   }
   const body = Buffer.concat([pktLine(`# service=${service}\n`), PKT_FLUSH, ...v0RefLines(repo, service), PKT_FLUSH]);
   return { status: 200, contentType: `application/x-${service}-advertisement`, body };
@@ -815,8 +962,7 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 
 /** A v2 fetch answer: acknowledgments (when haves were offered), shallow-info, then the packfile section. */
 function fetchV2(repo: RepoRec, args: FetchArgs): Buffer {
-  const selection = selectFetchObjects(repo, args.wants, args.haves, args.shallow, args.depth);
-  const pack = writePack(selection.objects);
+  const { selection, pack } = fetchPack(repo, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   if (args.haves.length > 0) {
     parts.push(pktLine('acknowledgments\n'));
@@ -839,8 +985,7 @@ function fetchV2(repo: RepoRec, args: FetchArgs): Buffer {
 
 /** A v0 fetch answer: NAK/ACK and shallow lines as plain packets, then the sideband pack. */
 function fetchV0(repo: RepoRec, args: FetchArgs): Buffer {
-  const selection = selectFetchObjects(repo, args.wants, args.haves, args.shallow, args.depth);
-  const pack = writePack(selection.objects);
+  const { selection, pack } = fetchPack(repo, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   const acks = args.haves.filter((have) => getCommit(repo, have) !== null);
   if (acks.length === 0) parts.push(pktLine('NAK\n'));
@@ -948,15 +1093,13 @@ export async function receivePack(repo: RepoRec, body: Buffer): Promise<WireAnsw
     report.push(pktLine(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`));
   }
   report.push(PKT_FLUSH);
-  const reportBytes = Buffer.concat(report);
   if (capSet.has('side-band-64k')) {
     const wrapped: Buffer[] = [];
     for (const piece of report) wrapped.push(pktLine(Buffer.concat([Buffer.from([1]), piece])));
     wrapped.push(PKT_FLUSH);
-    void reportBytes;
     return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat(wrapped) };
   }
-  return { status: 200, contentType: 'application/x-git-receive-pack-result', body: reportBytes };
+  return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat(report) };
 }
 
 /** Validate and apply one ref update; a refusal names its reason and changes nothing. */
